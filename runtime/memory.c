@@ -1067,13 +1067,38 @@ static int thaw_fault(uint64_t a) {
     return plat_mem_state(a & ~(PAGE - 1), (a & ~(PAGE - 1)) + PAGE, &end) == PLAT_PROT_RW;
 }
 
-// Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
+// NX2NAVI_MAP_UNLOCKED=1 (default 0): commit and decommit make their system call after frz_lock. Under the lock they
+// thaw the range and hold its regions thawed (thaw_ms), so no freeze and no lazy arming lands on them while the call
+// runs (mem_freeze and lazy_protect_locked refuse held regions); their callers hold the map lock, so mapping changes
+// stay serialised. While an area streams in the loaders map and unmap hundreds of MiB a second, each call then takes
+// up to 10 ms, and the replay's lazy write-back and every thaw and freeze queued behind it. The lazy heap, whose
+// first-use commits run under frz_lock, keeps the locked path.
+static int map_unlocked;   // read once at start, next to NX2NAVI_FREEZE_ASYNC
+
+static int map_unlocked_on(void) { return map_unlocked && !heap_lazy; }
+
+static void hold_range_locked(uint64_t a, uint64_t n) {
+    if (!n || a >= RT_ADDRESS_LIMIT) return;
+    uint64_t e = a + n - 1 < RT_ADDRESS_LIMIT ? a + n - 1 : RT_ADDRESS_LIMIT - 1;
+    uint32_t now = (uint32_t)plat_now_ms() | 1;
+    for (uint64_t r = a >> FRZ_SHIFT; r <= e >> FRZ_SHIFT; r++) thaw_ms[r] = now;
+}
+
+// Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done (with
+// map_unlocked the regions are thawed and held under the lock and the call runs after it).
 static void commit(uint64_t a, uint64_t n, const char *what) {
     plat_mutex_lock(&frz_lock);
     thaw_wait_locked(a, n);
     thaw_range_locked(a, n, 3);
-    int ok = !n || plat_mem_commit(a, n);
-    plat_mutex_unlock(&frz_lock);
+    int ok;
+    if (map_unlocked_on()) {
+        hold_range_locked(a, n);
+        plat_mutex_unlock(&frz_lock);
+        ok = !n || plat_mem_commit(a, n);
+    } else {
+        ok = !n || plat_mem_commit(a, n);
+        plat_mutex_unlock(&frz_lock);
+    }
     if (!ok) rt_fatal("memory: commit %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
 }
 
@@ -1081,8 +1106,15 @@ static void decommit(uint64_t a, uint64_t n, const char *what) {
     plat_mutex_lock(&frz_lock);
     thaw_wait_locked(a, n);
     thaw_range_locked(a, n, 3);
-    int ok = !n || plat_mem_decommit(a, n);
-    plat_mutex_unlock(&frz_lock);
+    int ok;
+    if (map_unlocked_on()) {
+        hold_range_locked(a, n);
+        plat_mutex_unlock(&frz_lock);
+        ok = !n || plat_mem_decommit(a, n);
+    } else {
+        ok = !n || plat_mem_decommit(a, n);
+        plat_mutex_unlock(&frz_lock);
+    }
     if (!ok) rt_fatal("memory: decommit %s %#llx+%#llx failed", what, (unsigned long long)a, (unsigned long long)n);
 }
 
@@ -1141,6 +1173,9 @@ void mem_init(void) {
         lz_want = 1;
         lz_chunk = cfg_bool("NX2NAVI_WB_LAZY_CHUNK");
     }
+    const char *mu = cfg_get("NX2NAVI_MAP_UNLOCKED");
+    map_unlocked = mu && !strcmp(mu, "1");
+    if (map_unlocked) rt_log("memory: commits and decommits run outside frz_lock (NX2NAVI_MAP_UNLOCKED)");
     const char *fa = cfg_get("NX2NAVI_FREEZE_ASYNC");   // thaws outside frz_lock (FRZ_THAWING); unset: on
     frz_async = !fa || !*fa || atoi(fa) != 0;
     const char *pool = cfg_get("NX2NAVI_APP_POOL");
